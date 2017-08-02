@@ -118,12 +118,12 @@ class GangliaClient(host: String,
 
   def discardSnapshots: Actor.Receive = {
     case _: TickMetricSnapshot =>
-      log.warn("UDP sender is not prepared yet, discarding TickMetricSnapshot")
+      log.warn("XDR sender is not prepared yet, discarding TickMetricSnapshot")
   }
 
   def connecting: Actor.Receive = discardSnapshots orElse {
     case CommandFailed(_: Connect) =>
-      log.warn("Unable to initialize UDP sender, retrying in {}", connectionRetryDelay)
+      log.warn("Unable to initialize XDR sender, retrying in {}", connectionRetryDelay)
       startReconnecting()
 
     case CommandFailed(write: Write) =>
@@ -131,7 +131,7 @@ class GangliaClient(host: String,
       bufferFailedWrite(write)
 
     case Udp.SimpleSenderReady =>
-      log.info("UDP sender is prepared to send data to Ganglia")
+      log.info("XDR sender is prepared to send data to Ganglia")
       context.become(sending(sender()))
   }
 
@@ -191,25 +191,25 @@ class GangliaClient(host: String,
     case (histogramKey, snap) =>
       val group = genName(metricPrefix, entity.name)
 
-      announce(genName(metricPrefix, entity.name, "count"), group, snap.numberOfMeasurements, histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "count"), group, snap.numberOfMeasurements, histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "min"), group, snap.min, histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "min"), group, snap.min, histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "max"), group, snap.max, histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "max"), group, snap.max, histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "p50"), group, snap.percentile(50d), histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "p50"), group, snap.percentile(50d), histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "p90"), group, snap.percentile(90d), histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "p90"), group, snap.percentile(90d), histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "p99"), group, snap.percentile(99d), histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "p99"), group, snap.percentile(99d), histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "sum"), group, snap.sum, histogramKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, histogramKey.name, "sum"), group, snap.sum, histogramKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
   }
@@ -218,16 +218,16 @@ class GangliaClient(host: String,
     case (gaugeKey, snap) =>
       val group = genName(metricPrefix, entity.name)
 
-      announce(genName(metricPrefix, entity.name, "min"), group, snap.min, gaugeKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, gaugeKey.name, "min"), group, snap.min, gaugeKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "max"), group, snap.max, gaugeKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, gaugeKey.name, "max"), group, snap.max, gaugeKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "sum"), group, snap.sum, gaugeKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, gaugeKey.name, "sum"), group, snap.sum, gaugeKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "avg"), group, average(snap), gaugeKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, gaugeKey.name, "avg"), group, average(snap), gaugeKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
   }
@@ -236,13 +236,13 @@ class GangliaClient(host: String,
     case (minMaxCounterKey, snap) =>
       val group = genName(metricPrefix, entity.name)
 
-      announce(genName(metricPrefix, entity.name, "min"), group, snap.min, minMaxCounterKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, minMaxCounterKey.name, "min"), group, snap.min, minMaxCounterKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "max"), group, snap.max, minMaxCounterKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, minMaxCounterKey.name, "max"), group, snap.max, minMaxCounterKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
-      announce(genName(metricPrefix, entity.name, "avg"), group, average(snap), minMaxCounterKey.unitOfMeasurement).foreach { data =>
+      announce(genName(metricPrefix, entity.name, minMaxCounterKey.name, "avg"), group, average(snap), minMaxCounterKey.unitOfMeasurement).foreach { data =>
         connection ! Udp.Send(data, remote)
       }
   }
@@ -352,21 +352,16 @@ object GangliaClient {
   private def sanitize(value: String): String =
     value.replace('/', '_').replace('.', '_')
 
-  private def genName(prefix: String, name: String): String =
-    new java.lang.StringBuilder()
+  private def genName(prefix: String, name: String, subnames: String*): String = {
+    val builder = new java.lang.StringBuilder()
       .append(prefix)
       .append(".")
       .append(sanitize(name))
-      .toString
 
-  private def genName(prefix: String, name: String, subname: String): String =
-    new java.lang.StringBuilder()
-      .append(prefix)
-      .append(".")
-      .append(sanitize(name))
-      .append(".")
-      .append(sanitize(subname))
-      .toString
+    subnames.foreach(subname => builder.append(".").append(sanitize(subname)))
+
+    builder.toString
+  }
 
   private def average(snapshot: Histogram.Snapshot): Long =
     if(snapshot.numberOfMeasurements > 0) snapshot.sum / snapshot.numberOfMeasurements else 0
