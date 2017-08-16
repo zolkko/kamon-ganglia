@@ -1,12 +1,13 @@
 Ganglia Integration
 ===================
 
-Reporting Metrics to Ganglia
-=============================
+The [kamon](https://kamon.io)'s reporter backend for Ganglia.
 
-[Ganglia] is a hardcore old-school monitoring system, that claims to
-be used on high-performance computing systems. It is use RDDTools for data storage and
-visualization.
+Ganglia is an old-school monitoring system, which claims to
+be used on many high-performance computing systems. Despite ganglia-monitor and
+gmetad are arguably nice programs, the ganglia-web application just sucks in so
+many ways, that, in fact, I am planning to use this project until we replace
+Ganglia with something more convenient in our cluster.
 
 Limitations
 -----------
@@ -45,3 +46,5 @@ kamon {
   }
 }
 ```
+
+For a complete example of how to enable the backend, please see `hello-akka-kamon` project under examples directory.
