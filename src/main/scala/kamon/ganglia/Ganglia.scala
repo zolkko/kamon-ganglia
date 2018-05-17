@@ -5,76 +5,94 @@ import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
 import scala.concurrent.duration._
-import scala.collection.JavaConverters._
+import scala.concurrent.Await
 
-import akka.actor.{Actor, ActorRef, ExtendedActorSystem, Extension, ExtensionId, ExtensionIdProvider, Props}
+import akka.actor.{Actor, ActorRef, ActorSystem, Props}
 import akka.io.Tcp._
 import akka.io.{IO, Udp}
 import akka.util.ByteString
-import kamon.Kamon
+import com.typesafe.config.Config
+import info.ganglia.gmetric4j.gmetric.{GMetricSlope, GMetricType}
+import info.ganglia.gmetric4j.xdr.v31x._
+import kamon.{Kamon, MetricReporter}
 import kamon.metric._
-import kamon.metric.SubscriptionsDispatcher.TickMetricSnapshot
-import kamon.util.ConfigTools.Syntax
-import kamon.metric.instrument.{Counter, Histogram, UnitOfMeasurement}
-import kamon.util.NeedToScale
 import org.slf4j.LoggerFactory
 import org.acplt.oncrpc.XdrBufferEncodingStream
-import info.ganglia.gmetric4j.gmetric.GMetricSlope
-import info.ganglia.gmetric4j.gmetric.GMetricType
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_extra_data
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_gmetric_string
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_metadata_message
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_metadata_msg
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_metadatadef
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_metric_id
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_msg_formats
-import info.ganglia.gmetric4j.xdr.v31x.Ganglia_value_msg
 
 
-object Ganglia extends ExtensionId[GangliaExtension] with ExtensionIdProvider {
-  override def lookup(): ExtensionId[_ <: Extension] = Ganglia
-  override def createExtension(system: ExtendedActorSystem): GangliaExtension = new GangliaExtension(system)
-}
+class GangliaMetricReporter extends MetricReporter {
 
-class GangliaExtension(system: ExtendedActorSystem) extends Kamon.Extension {
-  private val log = LoggerFactory.getLogger(classOf[GangliaExtension])
-  log.info("Starting the Kamon(Ganglia) extension")
+  @volatile
+  private var as: Option[ActorSystem] = None
 
-  private implicit val as = system
-  private val config = system.settings.config
-  private val gangliaConfig = config.getConfig("kamon.ganglia")
+  @volatile
+  private var client: Option[ActorRef] = None
 
-  private val metadataMessageInterval = gangliaConfig.getInt("meta-data-message-interval")
-  private val hostname = gangliaConfig.getString("hostname")
-  private val port = gangliaConfig.getInt("port")
-  private val metricPrefix = gangliaConfig.getString("metric-name-prefix")
-  private val failureRetryDelay = {
-    val duration = gangliaConfig.getDuration("failure-retry-delay")
-    FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
-  }
-  private val bufferSize = gangliaConfig.getInt("buffer-size")
+  private var settings = GangliaMetricReporter.readSettings(Kamon.config())
 
-  private val retryBufferSize = gangliaConfig.getInt("write-retry-buffer-size")
-
-  private val metricsSender = system.actorOf(Props(
-    new GangliaClient(hostname, port, failureRetryDelay, bufferSize, retryBufferSize, metadataMessageInterval, metricPrefix)),
-    "kamon-ganglia")
-
-  private val gangliaClient = gangliaConfig match {
-    case NeedToScale(scaleTimeTo, scaleMemoryTo) =>
-      system.actorOf(MetricScaleDecorator.props(scaleTimeTo, scaleMemoryTo, metricsSender), "ganglia-metric-scale-decorator")
-    case _ => metricsSender
-  }
-
-  private val subscriptions = gangliaConfig.getConfig("subscriptions")
-
-  subscriptions.firstLevelKeys.foreach { subscriptionCategory =>
-    subscriptions.getStringList(subscriptionCategory).asScala.foreach { pattern =>
-      Kamon.metrics.subscribe(subscriptionCategory, pattern, gangliaClient, permanently = true)
+  override def reportPeriodSnapshot(snapshot: PeriodSnapshot): Unit = {
+    for {
+      s <- as
+      c <- client
+    } {
+      implicit val sys: ActorSystem = s
+      c ! snapshot.metrics
     }
   }
 
+  override def start(): Unit = {
+    val actorSystem = ActorSystem("ganglia-reporter")
+    val cl = actorSystem.actorOf(GangliaClient.props(settings.hostname,
+      settings.port,
+      settings.failureRetryDelay,
+      settings.bufferSize,
+      settings.retryBufferSize,
+      settings.metadataMessageInterval,
+      settings.metricPrefix), "client")
+
+    as = Some(actorSystem)
+    client = Some(cl)
+  }
+
+  override def stop(): Unit = {
+    as.foreach { s =>
+      Await.ready(s.terminate(), Duration.Inf)
+    }
+  }
+
+  override def reconfigure(config: Config): Unit = {
+    settings = GangliaMetricReporter.readSettings(config)
+  }
+
 }
+
+object GangliaMetricReporter {
+
+  final case class Settings(
+    metricPrefix: String,
+    hostname: String,
+    port: Int,
+    metadataMessageInterval: Int,
+    failureRetryDelay: FiniteDuration,
+    bufferSize: Int,
+    retryBufferSize: Int)
+
+  def readSettings(config: Config): Settings = {
+    Settings(
+      metricPrefix = config.getString("kamon.ganglia.metric-name-prefix"),
+      hostname = config.getString("kamon.ganglia.hostname"),
+      port = config.getInt("kamon.ganglia.port"),
+      metadataMessageInterval = config.getInt("kamon.ganglia.meta-data-message-interval"),
+      failureRetryDelay = {
+        val duration = config.getDuration("kamon.ganglia.failure-retry-delay")
+        FiniteDuration(duration.toMillis, TimeUnit.MILLISECONDS)
+      },
+      bufferSize = config.getInt("kamon.ganglia.buffer-size"),
+      retryBufferSize = config.getInt("kamon.ganglia.write-retry-buffer-size"))
+  }
+
+}
+
 
 class GangliaClient(host: String,
                     port: Int,
@@ -108,7 +126,7 @@ class GangliaClient(host: String,
 
   def disconnected: Actor.Receive = discardSnapshots orElse {
     case GangliaClient.InitiateConnection =>
-      implicit val as = context.system
+      implicit val as: ActorSystem = context.system
       IO(Udp) ! Udp.SimpleSender
       context.become(connecting)
 
@@ -117,7 +135,7 @@ class GangliaClient(host: String,
   }
 
   def discardSnapshots: Actor.Receive = {
-    case _: TickMetricSnapshot =>
+    case _: PeriodSnapshot =>
       log.warn("XDR sender is not prepared yet, discarding TickMetricSnapshot")
   }
 
@@ -136,7 +154,7 @@ class GangliaClient(host: String,
   }
 
   def sending(connection: ActorRef): Actor.Receive = {
-    case snapshot: TickMetricSnapshot =>
+    case snapshot: PeriodSnapshot =>
       dispatchSnapshot(connection, snapshot)
 
     case _: ConnectionClosed =>
@@ -169,82 +187,65 @@ class GangliaClient(host: String,
     context.system.scheduler.scheduleOnce(connectionRetryDelay, self, GangliaClient.InitiateConnection)
   }
 
-  private def dispatchSnapshot(connection: ActorRef, snapshot: TickMetricSnapshot): Unit = {
-    for ((entity, entitySnapshot) <- snapshot.metrics) {
-      dispatchHistograms(connection, entity, entitySnapshot.histograms)
-      dispatchGauges(connection, entity, entitySnapshot.gauges)
-      dispatchMinMaxCounters(connection, entity, entitySnapshot.minMaxCounters)
-      dispatchCounters(connection, entity, entitySnapshot.counters)
+  private def dispatchSnapshot(connection: ActorRef, snapshot: PeriodSnapshot): Unit = {
+    dispatchMetricValue(connection, snapshot.metrics.gauges)
+    dispatchMetricValue(connection, snapshot.metrics.counters)
+    dispatchHistograms(connection, snapshot.metrics.histograms)
+    dispatchMinMaxCounters(connection, snapshot.metrics.rangeSamplers)
+  }
+
+  private def dispatchMetricValue(connection: ActorRef, gauges: Seq[MetricValue]): Unit = gauges foreach { gauge =>
+    val group = genName(metricPrefix, gauge.name)
+    announce(genName(metricPrefix, gauge.name, "value"), group, gauge.value, gauge.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+
+    for (tag <- gauge.tags) {
+      val subgroup = genName(metricPrefix, gauge.name, tag._1, tag._2)
+      announce(genName(metricPrefix, gauge.name, tag._1, tag._2, "value"), subgroup, gauge.value, gauge.unit).foreach { data =>
+        connection ! Udp.Send(data, remote)
+      }
     }
   }
 
-  private def dispatchCounters(connection: ActorRef, entity: Entity, counters: Map[CounterKey, Counter.Snapshot]) = counters foreach {
-    case (counterKey, snap) =>
-      val group = genName(metricPrefix, entity.name)
+  private def dispatchHistograms(connection: ActorRef, histograms: Seq[MetricDistribution]): Unit = histograms foreach { hist =>
+    val group = genName(metricPrefix, hist.name)
 
-      announce(group, group, snap.count, counterKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
+    announce(genName(metricPrefix, hist.name, "count"), group, hist.distribution.count, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "min"), group, hist.distribution.min, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "max"), group, hist.distribution.max, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "p50"), group, hist.distribution.percentile(50d).value, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "p90"), group, hist.distribution.percentile(90d).value, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "p99"), group, hist.distribution.percentile(99d).value, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "sum"), group, hist.distribution.sum, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
   }
 
-  private def dispatchHistograms(connection: ActorRef, entity: Entity, histograms: Map[HistogramKey, Histogram.Snapshot]) = histograms foreach {
-    case (histogramKey, snap) =>
-      val group = genName(metricPrefix, entity.name)
+  private def dispatchMinMaxCounters(connection: ActorRef, histograms: Seq[MetricDistribution]): Unit = histograms foreach { hist =>
+    val group = genName(metricPrefix, hist.name)
 
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "count"), group, snap.numberOfMeasurements, histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "min"), group, snap.min, histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "max"), group, snap.max, histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "p50"), group, snap.percentile(50d), histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "p90"), group, snap.percentile(90d), histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "p99"), group, snap.percentile(99d), histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, histogramKey.name, "sum"), group, snap.sum, histogramKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-  }
-
-  private def dispatchGauges(connection: ActorRef, entity: Entity, gauges: Map[GaugeKey, Histogram.Snapshot]) = gauges foreach {
-    case (gaugeKey, snap) =>
-      val group = genName(metricPrefix, entity.name)
-
-      announce(genName(metricPrefix, entity.name, gaugeKey.name, "min"), group, snap.min, gaugeKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, gaugeKey.name, "max"), group, snap.max, gaugeKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, gaugeKey.name, "sum"), group, snap.sum, gaugeKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, gaugeKey.name, "avg"), group, average(snap), gaugeKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-  }
-
-  private def dispatchMinMaxCounters(connection: ActorRef, entity: Entity, minMaxCounters: Map[MinMaxCounterKey, Histogram.Snapshot]) = minMaxCounters foreach {
-    case (minMaxCounterKey, snap) =>
-      val group = genName(metricPrefix, entity.name)
-
-      announce(genName(metricPrefix, entity.name, minMaxCounterKey.name, "min"), group, snap.min, minMaxCounterKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, minMaxCounterKey.name, "max"), group, snap.max, minMaxCounterKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
-      announce(genName(metricPrefix, entity.name, minMaxCounterKey.name, "avg"), group, average(snap), minMaxCounterKey.unitOfMeasurement).foreach { data =>
-        connection ! Udp.Send(data, remote)
-      }
+    announce(genName(metricPrefix, hist.name, "min"), group, hist.distribution.min, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "max"), group, hist.distribution.max, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
+    announce(genName(metricPrefix, hist.name, "avg"), group, hist.distribution.sum / hist.distribution.count, hist.unit).foreach { data =>
+      connection ! Udp.Send(data, remote)
+    }
   }
 
   private def isTimeToSendMetadata(metricName: String) = {
@@ -264,15 +265,14 @@ class GangliaClient(host: String,
     ret
   }
 
-  @throws[Exception]
-  private def announce(name: String, groupName: String, value: Long, units: UnitOfMeasurement): Seq[ByteString] = {
+  private def announce(name: String, groupName: String, value: Long, units: MeasurementUnit): Seq[ByteString] = {
     val metric_id = new Ganglia_metric_id
     metric_id.spoof = false
     metric_id.host = localHostName
     metric_id.name = name
 
     if (isTimeToSendMetadata(name)) {
-      encodeGMetric(metric_id, name, groupName, value.toString, GMetricType.DOUBLE, units.name, GMetricSlope.BOTH, TMAX, DMAX)
+      encodeGMetric(metric_id, name, groupName, value.toString, GMetricType.DOUBLE, units.magnitude.name, GMetricSlope.BOTH, TMAX, DMAX)
       val metaInfo = ByteString.fromArray(xdr.getXdrData, 0, xdr.getXdrLength)
 
       encodeGValue(metric_id, value.toString)
@@ -285,9 +285,9 @@ class GangliaClient(host: String,
     }
   }
 
-  @throws[Exception]
   private def encodeGMetric(metric_id: Ganglia_metric_id, groupName: String, name: String, value: String,
-                            `type`: GMetricType, units: String, slope: GMetricSlope, tmax: Int, dmax: Int) = {
+                            `type`: GMetricType, units: String, slope: GMetricSlope, tmax: Int, dmax: Int): Unit = {
+
     val metadata_message = new Ganglia_metadata_message
     val extra_data_array = new Array[Ganglia_extra_data](3)
 
@@ -327,8 +327,7 @@ class GangliaClient(host: String,
     xdr.endEncoding()
   }
 
-  @throws[Exception]
-  private def encodeGValue(metric_id: Ganglia_metric_id, value: String) = {
+  private def encodeGValue(metric_id: Ganglia_metric_id, value: String): Unit = {
 
     val value_msg = new Ganglia_value_msg
     value_msg.id = Ganglia_msg_formats.gmetric_string
@@ -363,6 +362,12 @@ object GangliaClient {
     builder.toString
   }
 
-  private def average(snapshot: Histogram.Snapshot): Long =
-    if(snapshot.numberOfMeasurements > 0) snapshot.sum / snapshot.numberOfMeasurements else 0
+  def props(host: String,
+            port: Int,
+            connectionRetryDelay: FiniteDuration,
+            bufferSize: Int,
+            writeRetryBufferSize: Int,
+            metadataMessageInterval: Int,
+            metricPrefix: String): Props =
+    Props(new GangliaClient(host, port, connectionRetryDelay, bufferSize, writeRetryBufferSize, metadataMessageInterval, metricPrefix))
 }
