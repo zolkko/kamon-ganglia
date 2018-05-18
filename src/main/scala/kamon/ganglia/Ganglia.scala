@@ -159,14 +159,14 @@ class GangliaClient(host: String,
       val metaInfo: Array[Byte] = Array.fill(xdr.getXdrLength)(0)
       System.arraycopy(xdr.getXdrData, 0, metaInfo, 0, xdr.getXdrLength)
 
-      encodeGValue(metric_id, value.toString)
+      encodeGValue(metric_id, value)
 
       val data: Array[Byte] = Array.fill(xdr.getXdrLength)(0)
       System.arraycopy(xdr.getXdrData, 0, data, 0, xdr.getXdrLength)
 
       Seq(metaInfo, data)
     } else {
-      encodeGValue(metric_id, value.toString)
+      encodeGValue(metric_id, value)
 
       val data: Array[Byte] = Array.fill(xdr.getXdrLength)(0)
       System.arraycopy(xdr.getXdrData, 0, data, 0, xdr.getXdrLength)
@@ -217,16 +217,16 @@ class GangliaClient(host: String,
     xdr.endEncoding()
   }
 
-  private def encodeGValue(metric_id: Ganglia_metric_id, value: String): Unit = {
+  private def encodeGValue(metricId: Ganglia_metric_id, value: Long): Unit = {
+
+    val dbl = new Ganglia_gmetric_double()
+    dbl.metric_id = metricId
+    dbl.fmt = "%f"
+    dbl.d = value.toDouble
 
     val value_msg = new Ganglia_value_msg
-    value_msg.id = Ganglia_msg_formats.gmetric_string
-
-    val str = new Ganglia_gmetric_string
-    str.str = value
-    str.metric_id = metric_id
-    str.fmt = "%s"
-    value_msg.gstr = str
+    value_msg.id = Ganglia_msg_formats.gmetric_double
+    value_msg.gd = dbl
 
     xdr.beginEncoding(address, port)
     value_msg.xdrEncode(xdr)
