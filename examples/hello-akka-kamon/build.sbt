@@ -13,9 +13,9 @@ lazy val root = (project in file(".")).
     name := "Hello",
     libraryDependencies ++= Seq(
       "ch.qos.logback"    %  "logback-classic" % "1.1.2",
-      "com.typesafe.akka" %% "akka-actor"      % "2.5.3",
-      "io.kamon" %% "kamon-core" % "0.6.7",
-      "io.kamon" %% "kamon-akka" % "0.6.3",
+      "com.typesafe.akka" %% "akka-actor"      % "2.5.12",
+      "io.kamon" %% "kamon-core" % "1.1.2",
+      "io.kamon" %% "kamon-akka-2.5" % "1.0.1",
       scalaTest % Test
     )
   )

@@ -3,14 +3,13 @@ package example
 import scala.concurrent.duration._
 
 import akka.actor.{Actor, ActorSystem, Props}
-import kamon.Kamon
 
 
 class TestActor extends Actor {
 
   implicit val ec = context.dispatcher
 
-  private val simpleCounter = Kamon.metrics.counter("simple-counter")
+  private val simpleCounter = kamon.Kamon.counter("simple-counter")
 
   private def random: Int = (scala.math.random * 100.0).toInt
 
@@ -29,13 +28,14 @@ class TestActor extends Actor {
 
 
 object Hello extends App {
-  Kamon.start()
+
+  kamon.Kamon.loadReportersFromConfig()
 
   implicit val system = ActorSystem("my-app")
   implicit val ec = system.dispatcher
   system.actorOf(Props(new TestActor))
 
   system.whenTerminated.onComplete { _ =>
-    Kamon.shutdown()
+    kamon.Kamon.stopAllReporters()
   }
 }
