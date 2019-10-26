@@ -1,18 +1,21 @@
 package kamon.ganglia
 
-import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 
 import scala.concurrent.duration._
-
 import com.typesafe.config.Config
 import info.ganglia.gmetric4j.gmetric.{GMetricSlope, GMetricType}
 import info.ganglia.gmetric4j.xdr.v31x._
-import kamon.{Kamon, MetricReporter}
-import kamon.metric._
 import org.slf4j.LoggerFactory
 import org.acplt.oncrpc.XdrBufferEncodingStream
+import kamon.Kamon
+import kamon.metric.{MeasurementUnit, MetricSnapshot, PeriodSnapshot}
+import kamon.module.{MetricReporter, ModuleFactory}
 
+
+class GangliaMetricReporterFactory extends ModuleFactory {
+  override def create(settings: ModuleFactory.Settings): GangliaMetricReporter = new GangliaMetricReporter()
+}
 
 class GangliaMetricReporter extends MetricReporter {
 
@@ -30,11 +33,7 @@ class GangliaMetricReporter extends MetricReporter {
     }
   }
 
-  override def start(): Unit = {
-  }
-
-  override def stop(): Unit = {
-  }
+  override def stop(): Unit = ()
 
   override def reconfigure(config: Config): Unit = {
     settings = GangliaMetricReporter.readSettings(config)
@@ -66,9 +65,7 @@ object GangliaMetricReporter {
       bufferSize = config.getInt("kamon.ganglia.buffer-size"),
       retryBufferSize = config.getInt("kamon.ganglia.write-retry-buffer-size"))
   }
-
 }
-
 
 class GangliaClient(host: String,
                     port: Int,
@@ -97,37 +94,48 @@ class GangliaClient(host: String,
   private val socket = new DatagramSocket
 
   def sendSnapshot(snapshot: PeriodSnapshot): Unit = {
-    val messages = dispatchMetricValue(snapshot.metrics.gauges) ++
-      dispatchMetricValue(snapshot.metrics.counters) ++
-      dispatchHistograms(snapshot.metrics.histograms) ++
-      dispatchMinMaxCounters(snapshot.metrics.rangeSamplers)
+    val messages = dispatchGaugeValue(snapshot.gauges) ++
+      dispatchCounterValue(snapshot.counters) ++
+      dispatchHistograms(snapshot.histograms) ++
+      dispatchMinMaxCounters(snapshot.rangeSamplers)
 
     sendUdp(messages)
   }
 
-  private def dispatchMetricValue(gauges: Seq[MetricValue]): Seq[Array[Byte]] = gauges flatMap { gauge =>
+  private def dispatchGaugeValue(gauges: Seq[MetricSnapshot.Values[Double]]): Seq[Array[Byte]] = gauges flatMap { gauge =>
     val group = genName(metricPrefix, gauge.name)
-    announce(genName(metricPrefix, gauge.name, "value"), group, gauge.value, gauge.unit)
+    gauge.instruments.flatMap { instrument =>
+      announce(genName(metricPrefix, gauge.name, "value"), group, instrument.value.toLong, gauge.settings.unit)
+    }
   }
 
-  private def dispatchHistograms(histograms: Seq[MetricDistribution]): Seq[Array[Byte]] = histograms flatMap { hist =>
-    val group = genName(metricPrefix, hist.name)
-
-    announce(genName(metricPrefix, hist.name, "count"), group, hist.distribution.count, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "min"), group, hist.distribution.min, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "max"), group, hist.distribution.max, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "p50"), group, hist.distribution.percentile(50d).value, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "p90"), group, hist.distribution.percentile(90d).value, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "p99"), group, hist.distribution.percentile(99d).value, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "sum"), group, hist.distribution.sum, hist.unit)
+  private def dispatchCounterValue(gauges: Seq[MetricSnapshot.Values[Long]]): Seq[Array[Byte]] = gauges flatMap { counter =>
+    val group = genName(metricPrefix, counter.name)
+    counter.instruments.flatMap { instrument =>
+      announce(genName(metricPrefix, counter.name, "value"), group, instrument.value, counter.settings.unit)
+    }
   }
 
-  private def dispatchMinMaxCounters(histograms: Seq[MetricDistribution]): Seq[Array[Byte]] = histograms flatMap { hist =>
+  private def dispatchHistograms(histograms: Seq[MetricSnapshot.Distributions]): Seq[Array[Byte]] = histograms flatMap { hist =>
     val group = genName(metricPrefix, hist.name)
+    hist.instruments.flatMap { instrument =>
+      announce(genName(metricPrefix, hist.name, "count"), group, instrument.value.count, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "min"), group, instrument.value.min, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "max"), group, instrument.value.max, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "p50"), group, instrument.value.percentile(50d).value, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "p90"), group, instrument.value.percentile(90d).value, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "p99"), group, instrument.value.percentile(99d).value, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "sum"), group, instrument.value.sum, hist.settings.unit)
+    }
+  }
 
-    announce(genName(metricPrefix, hist.name, "min"), group, hist.distribution.min, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "max"), group, hist.distribution.max, hist.unit) ++
-      announce(genName(metricPrefix, hist.name, "avg"), group, hist.distribution.sum / hist.distribution.count, hist.unit)
+  private def dispatchMinMaxCounters(histograms: Seq[MetricSnapshot.Distributions]): Seq[Array[Byte]] = histograms flatMap { hist =>
+    val group = genName(metricPrefix, hist.name)
+    hist.instruments.flatMap { instrument =>
+      announce(genName(metricPrefix, hist.name, "min"), group, instrument.value.min, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "max"), group, instrument.value.max, hist.settings.unit) ++
+        announce(genName(metricPrefix, hist.name, "avg"), group, instrument.value.sum / instrument.value.count, hist.settings.unit)
+    }
   }
 
   private def isTimeToSendMetadata(metricName: String) = {
